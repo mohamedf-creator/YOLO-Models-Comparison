@@ -7,9 +7,253 @@ from ultralytics import YOLO
 from roboflow import Roboflow
 import json
 =================================================
+API_KEY   = "KEY"
+WORKSPACE = "name"
+PROJECT   = "prooject name"
+VERSION   = 1
+# ─────────────────────────────────────────────────────────────────────────────
+
+rf      = Roboflow(api_key=API_KEY)
+dataset = rf.workspace(WORKSPACE).project(PROJECT).version(VERSION).download("yolov26")
+
+BASE      = Path(dataset.location)
+ORIG_YAML = BASE / "data.yaml"
+print("Dataset at:", BASE)
+
 import pandas as pd
 import os
+=================================================
+AUG_PIPELINE = A.Compose([
+    A.HorizontalFlip(p=0.5),
+    A.VerticalFlip(p=0.3),
+    A.Rotate(limit=15, p=0.5),
+    A.Affine(
+    translate_percent=0.05,
+    scale=(0.8, 1.2),
+    rotate=(-10, 10),
+    p=0.5
+),
+    A.RandomBrightnessContrast(brightness_limit=0.3, contrast_limit=0.3, p=0.5),
+    A.OneOf([A.GaussianBlur(blur_limit=(3,5), p=0.2), A.GaussNoise()], p=0.2),
+], bbox_params=A.BboxParams(format='yolo', label_fields=['cls'], min_visibility=0.2))
 
+
+# ── Label I/O helpers (unchanged) ────────────────────────────────────────────
+def read_label(lbl_path):
+    if not Path(lbl_path).exists():
+        return [], []
+    rows = open(lbl_path).read().strip().splitlines()
+    bboxes, cls = [], []
+    for r in rows:
+        c, x, y, w, h = r.split()
+        bboxes.append([float(x), float(y), float(w), float(h)])
+        cls.append(int(c))
+    return bboxes, cls
+
+def save_label(lbl_path, bboxes, cls):
+    with open(lbl_path, 'w') as f:
+        for c, b in zip(cls, bboxes):
+            f.write(f"{c} {b[0]:.6f} {b[1]:.6f} {b[2]:.6f} {b[3]:.6f}\n")
+
+
+# ── NEW: Multi-image augmentation helpers ─────────────────────────────────────
+
+def apply_mosaic(images, labels_list, size=640):
+    """
+    Stitch 4 images into a 2×2 grid (size × size output).
+    Each image is placed in one quadrant; bboxes are re-normalised accordingly.
+    """
+    h = w = size
+    cx = random.randint(int(w*0.3), int(w*0.7))
+    cy = random.randint(int(h*0.3), int(h*0.7))
+    canvas = np.zeros((h, w, 3), dtype=np.uint8)
+    out_bboxes, out_cls = [], []
+
+    quadrants = [(0, 0, cx, cy), (cx, 0, w, cy),
+                 (0, cy, cx, h), (cx, cy, w, h)]
+
+    for img, (bboxes, cls), (x1, y1, x2, y2) in zip(images, labels_list, quadrants):
+        qw, qh = x2 - x1, y2 - y1
+        canvas[y1:y2, x1:x2] = cv2.resize(img, (qw, qh))
+
+        for bbox, c in zip(bboxes, cls):
+            bx, by, bw, bh = bbox
+            # absolute centre in quadrant → absolute in full canvas
+            abs_cx = bx * qw + x1
+            abs_cy = by * qh + y1
+            abs_w  = bw * qw
+            abs_h  = bh * qh
+            # back to YOLO-normalised
+            nx, ny = abs_cx / w, abs_cy / h
+            nw, nh = abs_w  / w, abs_h  / h
+            # clip to [0,1]
+            xmin = max(0.0, nx - nw / 2)
+            xmax = min(1.0, nx + nw / 2)
+            ymin = max(0.0, ny - nh / 2)
+            ymax = min(1.0, ny + nh / 2)
+            if (xmax - xmin) > 0.01 and (ymax - ymin) > 0.01:
+                out_bboxes.append([(xmin + xmax) / 2, (ymin + ymax) / 2,
+                                   xmax - xmin,       ymax - ymin])
+                out_cls.append(c)
+
+    return canvas, out_bboxes, out_cls
+
+
+def apply_mixup(img1, bboxes1, cls1, img2, bboxes2, cls2, alpha=0.2):
+    """
+    Alpha-blend two images; keep all labels from both (standard MixUp for detection).
+    """
+    lam  = random.uniform(alpha, 1.0 - alpha)
+    img2r = cv2.resize(img2, (img1.shape[1], img1.shape[0]))
+    mixed = cv2.addWeighted(img1, lam, img2r, 1.0 - lam, 0)
+    return mixed, list(bboxes1) + list(bboxes2), list(cls1) + list(cls2)
+
+
+def apply_cutmix(img1, bboxes1, cls1, img2, bboxes2, cls2):
+    """
+    Paste a random rectangular patch from img2 onto img1.
+    Only labels whose centre falls inside the pasted patch are kept from img2;
+    all labels from img1 are kept.
+    """
+    h, w   = img1.shape[:2]
+    img2r  = cv2.resize(img2, (w, h))
+
+    cut_w  = int(w * random.uniform(0.1, 0.3))
+    cut_h  = int(h * random.uniform(0.1, 0.3))
+    x1     = random.randint(0, w - cut_w)
+    y1     = random.randint(0, h - cut_h)
+
+    result = img1.copy()
+    result[y1:y1 + cut_h, x1:x1 + cut_w] = img2r[y1:y1 + cut_h, x1:x1 + cut_w]
+
+    out_bboxes, out_cls = list(bboxes1), list(cls1)
+    for bbox, c in zip(bboxes2, cls2):
+        bx, by = bbox[0] * w, bbox[1] * h
+        if x1 <= bx <= x1 + cut_w and y1 <= by <= y1 + cut_h:
+            out_bboxes.append(bbox)
+            out_cls.append(c)
+
+    return result, out_bboxes, out_cls
+
+
+# ── UPDATED: augment_to_target with all three new methods ────────────────────
+
+def augment_to_target(src_img, src_lbl, dst_img, dst_lbl, target):
+    """
+    Copy originals, then generate augmented images (basic / mosaic / mixup / cutmix)
+    until count EXCEEDS target, then delete the surplus so count == target exactly.
+    """
+    Path(dst_img).mkdir(parents=True, exist_ok=True)
+    Path(dst_lbl).mkdir(parents=True, exist_ok=True)
+
+    images = sorted(list(Path(src_img).glob("*.jpg")) +
+                    list(Path(src_img).glob("*.png")))
+    # Filter to images that actually have labels (needed for multi-image ops)
+    labeled = [p for p in images
+               if (Path(src_lbl) / (p.stem + ".txt")).exists()
+               and read_label(Path(src_lbl) / (p.stem + ".txt"))[0]]
+
+    # ── 1. Copy originals ────────────────────────────────────────────────────
+    for img in images:
+        shutil.copy(img, dst_img)
+        lbl = Path(src_lbl) / (img.stem + ".txt")
+        if lbl.exists():
+            shutil.copy(lbl, dst_lbl)
+
+    count  = len(images)
+    aug_id = 0                        # unique suffix for generated files
+    METHODS = ["basic", "basic", "basic", "mosaic", "mixup", "cutmix"]
+
+    # ── 2. Generate until we EXCEED the target ───────────────────────────────
+    while count < target:
+        method = random.choice(METHODS)
+        new_id = f"aug_{aug_id:06d}"
+        aug_id += 1
+
+        try:
+            if method == "basic":
+                src    = random.choice(labeled)
+                image  = cv2.cvtColor(cv2.imread(str(src)), cv2.COLOR_BGR2RGB)
+                bboxes, cls = read_label(Path(src_lbl) / (src.stem + ".txt"))
+                out    = AUG_PIPELINE(image=image, bboxes=bboxes, cls=cls)
+                out_img, out_bboxes, out_cls = out['image'], out['bboxes'], out['cls']
+
+            elif method == "mosaic":
+                srcs   = random.choices(labeled, k=4)
+                imgs   = [cv2.cvtColor(cv2.imread(str(s)), cv2.COLOR_BGR2RGB) for s in srcs]
+                lbls   = [read_label(Path(src_lbl) / (s.stem + ".txt")) for s in srcs]
+                out_img, out_bboxes, out_cls = apply_mosaic(imgs, lbls)
+
+            elif method == "mixup":
+                s1, s2 = random.choices(labeled, k=2)
+                i1 = cv2.cvtColor(cv2.imread(str(s1)), cv2.COLOR_BGR2RGB)
+                i2 = cv2.cvtColor(cv2.imread(str(s2)), cv2.COLOR_BGR2RGB)
+                b1, c1 = read_label(Path(src_lbl) / (s1.stem + ".txt"))
+                b2, c2 = read_label(Path(src_lbl) / (s2.stem + ".txt"))
+                out_img, out_bboxes, out_cls = apply_mixup(i1, b1, c1, i2, b2, c2)
+
+            elif method == "cutmix":
+                s1, s2 = random.choices(labeled, k=2)
+                i1 = cv2.cvtColor(cv2.imread(str(s1)), cv2.COLOR_BGR2RGB)
+                i2 = cv2.cvtColor(cv2.imread(str(s2)), cv2.COLOR_BGR2RGB)
+                b1, c1 = read_label(Path(src_lbl) / (s1.stem + ".txt"))
+                b2, c2 = read_label(Path(src_lbl) / (s2.stem + ".txt"))
+                out_img, out_bboxes, out_cls = apply_cutmix(i1, b1, c1, i2, b2, c2)
+
+            if not out_bboxes:
+                continue
+
+            cv2.imwrite(str(Path(dst_img) / f"{new_id}.jpg"),
+                        cv2.cvtColor(out_img, cv2.COLOR_RGB2BGR))
+            save_label(Path(dst_lbl) / f"{new_id}.txt", out_bboxes, out_cls)
+            count += 1
+
+        except Exception as e:
+            print(f"  [warn] {method} failed: {e} — skipping")
+            continue
+
+    # ── 3. Trim surplus augmented files to hit the target exactly ────────────
+    surplus = count - target
+    if surplus > 0:
+        aug_imgs = sorted(Path(dst_img).glob("aug_*.jpg"))   # only generated files
+        for p in aug_imgs[:surplus]:
+            p.unlink()
+            lbl = Path(dst_lbl) / (p.stem + ".txt")
+            if lbl.exists():
+                lbl.unlink()
+        count -= surplus
+
+    print(f"  Done: {count} images in {dst_img}")
+
+
+# ── YAML helper (unchanged) ───────────────────────────────────────────────────
+def make_yaml(base_yaml, train_img, val_img, out_yaml):
+    cfg = yaml.safe_load(open(base_yaml))
+    cfg['train'] = str(Path(train_img).resolve())
+    cfg['val']   = str(Path(val_img).resolve())
+    yaml.dump(cfg, open(out_yaml, 'w'))
+    print("YAML saved:", out_yaml)
+=========================================
+augment_to_target(
+    src_img = BASE / "train/images",
+    src_lbl = BASE / "train/labels",
+    dst_img = "self_aug/train/images",
+    dst_lbl = "self_aug/train/labels",
+    target  = 3500
+)
+
+VAL_IMG  = BASE / "valid/images"
+TEST_IMG = BASE / "test/images"
+
+make_yaml(
+    base_yaml = ORIG_YAML,
+    train_img = "self_aug/train/images",
+    val_img   = VAL_IMG,
+    out_yaml  = "self_aug/data.yaml"
+)
+=========================================
+len(os.listdir("/kaggle/working/self_aug/train/labels"))
+=========================================
 def export_pr_curve_to_csv(results, output_name, output_folder="PR_Curve_data"):
     """
     Export YOLO PR curve data to a CSV file.

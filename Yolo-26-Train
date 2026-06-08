@@ -6,6 +6,48 @@ from pathlib import Path
 from ultralytics import YOLO
 from roboflow import Roboflow
 import json
+=================================================
+import pandas as pd
+import os
+
+def export_pr_curve_to_csv(results, output_name, output_folder="PR_Curve_data"):
+    """
+    Export YOLO PR curve data to a CSV file.
+
+    Args:
+        results: YOLO results object returned from model.val() or model.train()
+        output_name (str): Name of the CSV file (without extension)
+        output_folder (str): Folder to save the CSV into
+    """
+
+    # 1. Extract PR curve data
+    recall = results.curves_results[0][0]
+    precision_matrix = results.curves_results[0][1]
+    class_names = results.names
+    num_classes = len(class_names)
+
+    # 2. Build dictionary starting with Recall
+    data_dict = {"Recall": recall}
+
+    # 3. Add Precision for each class
+    for i in range(num_classes):
+        class_name = class_names[i].capitalize()
+        data_dict[f"Precision_{class_name}"] = precision_matrix[i, :]
+
+    # 4. Add mean precision across classes
+    mean_precision = precision_matrix[:num_classes, :].mean(axis=0)
+    data_dict["Precision_All_Classes"] = mean_precision
+
+    # 5. Create DataFrame
+    df = pd.DataFrame(data_dict)
+
+    # 6. Save CSV
+    os.makedirs(output_folder, exist_ok=True)
+    csv_path = os.path.join(output_folder, f"{output_name}.csv")
+    df.to_csv(csv_path, index=False)
+
+    print(f"✅ PR data saved to: {csv_path}")
+=================================================
 MODELS = [
     # "yolov8l.pt",
     # "yolov9c.pt",
@@ -16,7 +58,7 @@ MODELS = [
 ]
 
 TRAIN_ARGS = dict(
-    data="/kaggle/input/datasets/mohamed111111/multidata", epochs=150, imgsz=640, device="0,1", batch=28,
+    data="data", epochs=150, imgsz=640, device="0,1", batch=28,
     mosaic=0.0, mixup=0.0, copy_paste=0.0, cutmix=0.0,
     hsv_h=0.0, hsv_s=0.0, hsv_v=0.0,
     degrees=0.0, translate=0.0, scale=0.0, shear=0.0,
@@ -55,3 +97,183 @@ for model_name in MODELS:
     except Exception as e:
         print(f" Upload failed: {e}")
         print(f"  Weights at: {run_dir}/weights/best.pt")
+import pandas as pd
+import os
+
+def export_pr_curve_to_csv(results, output_name, output_folder="PR_Curve_data"):
+    """
+    Export YOLO PR curve data to a CSV file.
+
+    Args:
+        results: YOLO results object returned from model.val() or model.train()
+        output_name (str): Name of the CSV file (without extension)
+        output_folder (str): Folder to save the CSV into
+    """
+
+    # 1. Extract PR curve data
+    recall = results.curves_results[0][0]
+    precision_matrix = results.curves_results[0][1]
+    class_names = results.names
+    num_classes = len(class_names)
+
+    # 2. Build dictionary starting with Recall
+    data_dict = {"Recall": recall}
+
+    # 3. Add Precision for each class
+    for i in range(num_classes):
+        class_name = class_names[i].capitalize()
+        data_dict[f"Precision_{class_name}"] = precision_matrix[i, :]
+
+    # 4. Add mean precision across classes
+    mean_precision = precision_matrix[:num_classes, :].mean(axis=0)
+    data_dict["Precision_All_Classes"] = mean_precision
+
+    # 5. Create DataFrame
+    df = pd.DataFrame(data_dict)
+
+    # 6. Save CSV
+    os.makedirs(output_folder, exist_ok=True)
+    csv_path = os.path.join(output_folder, f"{output_name}.csv")
+    df.to_csv(csv_path, index=False)
+
+    print(f"✅ PR data saved to: {csv_path}")
+
+
+from ultralytics import YOLO
+import os
+
+best_weights = "best.pt"
+BEST_MODEL = os.path.basename(best_weights)
+
+best_weights = "best.pt"
+ORIG_YAML = "data.yaml"
+
+BASE = "datasets"
+
+best_model = YOLO(best_weights)
+
+metrics_test = best_model.val(
+    data=ORIG_YAML,
+    split="test",
+    device=0
+)
+
+_ = best_model.predict(
+    source=f'{BASE}/test/images',
+    conf=0.25,
+    iou=0.6,
+    imgsz=640,
+    save=True,
+    save_txt=True,
+    save_conf=True,
+    device=0,
+    name='test_set'
+)
+
+print(f"\n{'='*60}")
+print(f"TEST RESULTS — {BEST_MODEL}")
+print(f"{'='*60}")
+print(f"  mAP50    : {metrics_test.box.map50:.4f}")
+print(f"  mAP50-95 : {metrics_test.box.map:.4f}")
+print(f"  Precision: {metrics_test.box.mp:.4f}")
+print(f"  Recall   : {metrics_test.box.mr:.4f}")
+
+
+===============================================
+
+import numpy as np
+import pandas as pd
+import os
+import yaml
+from ultralytics import YOLO
+# --- 1. paths ---
+dataset_root = "datasets"
+model_path = "best.pt"
+working_dir = "/kaggle/working/"
+
+print("🔍 Folder inspection...")
+
+def find_img_path(root, key):
+    for r, dirs, files in os.walk(root):
+        if any(f.lower().endswith(('.png', '.jpg', '.jpeg')) for f in files) and key in r.lower():
+            return r
+    return None
+
+test_images = find_img_path(dataset_root, "test")
+val_images = find_img_path(dataset_root, "valid") or find_img_path(dataset_root, "val") or test_images
+
+if not test_images:
+    print("❌ Error: No images were found.")
+else:
+    # --- 2. load models and predict (Predict) ---
+    model = YOLO(model_path)
+    print("📸 Images are being processed and generated. (Predict)...")
+    
+    model.predict(
+        source=test_images,
+        conf=0.25,
+        save=True,
+        save_txt=True,
+        name='construction_predictions' #   images
+    )
+
+    # --- 3.    YAML file ---
+    try:
+        with open(os.path.join(dataset_root, "data.yaml"), 'r') as f:
+            orig_yaml = yaml.safe_load(f)
+    except:
+        orig_yaml = {'nc': 3, 'names': ['Class0', 'Class1', 'Class2']}
+
+    temp_yaml_path = os.path.join(working_dir, "research_config.yaml")
+    with open(temp_yaml_path, 'w') as f:
+        yaml.dump({
+            'path': dataset_root,
+            'train': test_images,
+            'val': val_images,
+            'test': test_images,
+            'nc': orig_yaml['nc'],
+            'names': orig_yaml['names']
+        }, f)
+
+    # --- 4.  (Validation) extract the curves ---
+    print("📊   extracting the corrected PR curve. ...")
+    metrics = model.val(data=temp_yaml_path, split="test", imgsz=640)
+
+    # --- 5. corrected PR data extraction function    ---
+    def save_final_pr_data(val_metrics, output_name="final_correct_pr_curve.csv"):
+        #   PR  (X=Recall, Y=Precision)
+        target_curve = next((c for c in val_metrics.curves_results if 'Recall' in c[2] and 'Precision' in c[3]), None)
+        
+        if target_curve:
+            x_recall = np.array(target_curve[0]).flatten()
+            y_precision = np.array(target_curve[1])
+            
+            df = pd.DataFrame({'Recall': x_recall})
+            names = val_metrics.names
+            
+            # Link each class to its data based
+            for idx, name in names.items():
+                if idx < y_precision.shape[0]:
+                    df[f"Class_{name}"] = y_precision[idx]
+            
+            # Mean (All Classes)
+            if y_precision.shape[0] > len(names):
+                df["All_Classes_Mean"] = y_precision[-1]
+            else:
+                df["All_Classes_Mean"] = y_precision[:len(names)].mean(axis=0)
+                
+            df.to_csv(os.path.join(working_dir, output_name), index=False)
+            return True
+        return False
+
+    if save_final_pr_data(metrics):
+        print(f"\n{'='*50}")
+        print(f"✅ Done!")
+        print(f"📍 Predicted images: {working_dir}runs/detect/construction_predictions")
+        print(f"📂 Results file: {working_dir}final_correct_pr_curve.csv")
+        print(f"📈 mAP50: {metrics.box.map50:.4f}")
+        print(f"{'='*50}")
+    else:
+        print("⚠️ error extracting the CSV file..")
+
+
